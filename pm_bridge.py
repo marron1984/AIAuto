@@ -352,6 +352,120 @@ def apply_file_changes(file_blocks: list, dry_run: bool = False, interactive: bo
     return success
 
 
+def find_projects(search_dirs: list = None, max_depth: int = 3) -> list:
+    """プロジェクトディレクトリを検索"""
+    if search_dirs is None:
+        home = os.path.expanduser("~")
+        search_dirs = [
+            home,
+            os.path.join(home, "Documents"),
+            os.path.join(home, "Projects"),
+            os.path.join(home, "projects"),
+            os.path.join(home, "dev"),
+            os.path.join(home, "work"),
+            os.path.join(home, "src"),
+            os.path.join(home, "code"),
+            os.path.join(home, "repos"),
+            os.path.join(home, "github"),
+            "/tmp",
+        ]
+
+    # プロジェクトを示すマーカーファイル
+    project_markers = ['.git', 'package.json', 'requirements.txt', 'Cargo.toml',
+                       'go.mod', 'pom.xml', 'build.gradle', 'Makefile', 'CMakeLists.txt']
+
+    projects = []
+    seen = set()
+
+    for search_dir in search_dirs:
+        if not os.path.isdir(search_dir):
+            continue
+
+        for root, dirs, files in os.walk(search_dir):
+            # 深さ制限
+            depth = root[len(search_dir):].count(os.sep)
+            if depth >= max_depth:
+                dirs[:] = []
+                continue
+
+            # 除外ディレクトリ
+            dirs[:] = [d for d in dirs if d not in {'node_modules', '.git', 'venv', '.venv', '__pycache__'}]
+
+            # プロジェクトマーカーをチェック
+            for marker in project_markers:
+                marker_path = os.path.join(root, marker)
+                if os.path.exists(marker_path):
+                    real_path = os.path.realpath(root)
+                    if real_path not in seen:
+                        seen.add(real_path)
+                        projects.append(real_path)
+                    break
+
+    # 更新日時でソート（新しい順）
+    projects.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0, reverse=True)
+    return projects
+
+
+def select_project_interactive(max_display: int = 20) -> str:
+    """インタラクティブにプロジェクトを選択"""
+    print("🔍 プロジェクトを検索中...")
+    projects = find_projects()
+
+    if not projects:
+        print("プロジェクトが見つかりませんでした。")
+        return None
+
+    print(f"\n📂 プロジェクト一覧 ({len(projects)} 件):")
+    print("-" * 60)
+
+    display_projects = projects[:max_display]
+    for i, project in enumerate(display_projects, 1):
+        # プロジェクト名と親ディレクトリを表示
+        name = os.path.basename(project)
+        parent = os.path.dirname(project)
+
+        # Git情報があれば取得
+        git_dir = os.path.join(project, '.git')
+        if os.path.isdir(git_dir):
+            marker = "📁"
+        else:
+            marker = "📄"
+
+        print(f"  [{i:2d}] {marker} {name}")
+        print(f"       └─ {parent}")
+
+    if len(projects) > max_display:
+        print(f"\n  ... 他 {len(projects) - max_display} 件")
+
+    print("-" * 60)
+    print("番号を入力 / パスを直接入力 / 'q' でキャンセル")
+
+    while True:
+        choice = input("選択: ").strip()
+
+        if choice.lower() == 'q':
+            return None
+
+        # 数字の場合
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(display_projects):
+                return display_projects[idx]
+            print("無効な番号です。")
+            continue
+
+        # パスの場合
+        if os.path.isdir(choice):
+            return os.path.realpath(choice)
+
+        # 展開してみる
+        expanded = os.path.expanduser(choice)
+        if os.path.isdir(expanded):
+            return os.path.realpath(expanded)
+
+        print("無効な入力です。番号またはパスを入力してください。")
+
+
 def save_conversation_log(project_status: str, pm_instruction: str, claude_response: str, log_file: str = "bridge_log.txt"):
     """会話ログを保存"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -386,6 +500,8 @@ def main():
 使用例:
   python pm_bridge.py --auto                    # 完全自動モード
   python pm_bridge.py --auto --confirm          # 選択モード（ファイル選択可）
+  python pm_bridge.py --auto -s                 # プロジェクト選択 + 自動モード
+  python pm_bridge.py --auto -s --confirm       # プロジェクト選択 + ファイル選択
   python pm_bridge.py --auto --dry-run          # ドライラン
   python pm_bridge.py --pm-only                 # PMの指示のみ取得
   python pm_bridge.py --status-only             # プロジェクト状況のみ表示
@@ -402,6 +518,7 @@ def main():
     parser.add_argument("--implement-only", action="store_true", help="実装モード（手動入力）")
     parser.add_argument("--status-only", action="store_true", help="プロジェクト状況のみ出力")
     parser.add_argument("--confirm", action="store_true", help="ファイル適用前に確認・選択する")
+    parser.add_argument("--select-project", "-s", action="store_true", help="プロジェクトを選択する")
     parser.add_argument("-d", "--directory", default=".", help="対象ディレクトリ")
     parser.add_argument("-t", "--task", default="", help="タスクの説明")
     parser.add_argument("--exclude", action="append", help="除外パターンを追加")
@@ -418,10 +535,20 @@ def main():
     if args.exclude:
         excludes.update(args.exclude)
 
+    # プロジェクト選択モード
+    target_directory = args.directory
+    if args.select_project:
+        selected = select_project_interactive()
+        if selected is None:
+            print("キャンセルしました。")
+            return
+        target_directory = selected
+        print(f"\n✅ 選択されたプロジェクト: {target_directory}\n")
+
     try:
         print("📊 プロジェクト状況を収集中...")
         project_status = generate_project_status(
-            root_dir=args.directory,
+            root_dir=target_directory,
             excludes=excludes,
             include_all_files=args.include_all,
             max_files=args.max_files,
